@@ -1,0 +1,4 @@
+With probe set to report at 10Hz, sending both meteorology and state packets:
+First timed run: 10 kB in 153 seconds
+Second timed run: 10 kB in 154 seconds
+Third timed run: 10 kB in 153 seconds
