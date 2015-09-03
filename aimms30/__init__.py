@@ -10,4 +10,4 @@ from .aimms30 import PacketSizeError
 from .aimms30 import ChecksumMismatch
 
 # Misc stuff
-from . import utils
+# from . import utils

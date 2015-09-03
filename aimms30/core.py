@@ -26,8 +26,15 @@ from .utils import ChecksumMismatch
 from .utils import ParsingError
 from .utils import SliceDeque
 from .utils import MinimumLoopDelay
+from .utils import RestfulDictHandler
+from .utils import QuietRestfulDictHandler
+from .utils import TestHandler
+from .utils import ThreadedStatefulSocketServer
 from abc import ABCMeta
 from abc import abstractmethod
+import http.server
+import socketserver
+import time
 
 
 checksum_warning = \
@@ -50,8 +57,10 @@ class ThreadMonster():
             self.add_thread(self.my_captain, 'master')
         
     def __enter__(self):
+        self.start()
         for thread in self.threads.values():
             thread.start()
+        self.on_start()
         return self
         
     def __exit__(self, exception_type, exception_value, traceback):
@@ -91,6 +100,18 @@ class ThreadMonster():
             
     def stop(self):
         self.exit_flag.set()
+        
+    def start(self):
+        ''' Catch any super() invocations.
+        Runs BEFORE threads are started.
+        '''
+        pass
+        
+    def on_start(self):
+        ''' Catch any super() invocations.
+        Runs AFTER threads are started.
+        '''
+        pass
 
 
 class FileRecorder(ThreadMonster):
@@ -100,6 +121,7 @@ class FileRecorder(ThreadMonster):
         self._file_q = Queue()
         self.add_thread(task=self.dump, name='file_recorder', 
                         no_faster_than=.001)
+        self._f = None
     
     def dump(self):
         ''' Appends a string to the supplied file and adds a newline.
@@ -111,9 +133,19 @@ class FileRecorder(ThreadMonster):
             return
         
         s = json.dumps(obj)
-        with open(self.filename, 'a+') as f:
-            f.write(s)
-            f.write('\n')
+        self._f.write(s)
+        self._f.write('\n')
+            
+    def __enter__(self):
+        super().__enter__()
+        # Open our file and do the usual return.
+        self._f = open(self.filename, 'a+')
+        return self
+        
+    def __exit__(self, *args, **kwargs):
+        # Close our file, then call super.
+        self._f.close()
+        super().__exit__(*args, **kwargs)
             
     def schedule_object(self, obj):
         ''' Schedules an object to be recorded to the file. Threadsafe.
@@ -125,7 +157,10 @@ class SerialListener(ThreadMonster):
     def __init__(self, port, baud, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Sets (ex: self.COM5_ser) to be the serial connection
-        self.connection = serial.Serial(port=port, baudrate=baud, timeout=0)
+        self.connection = serial.Serial()
+        self.connection.baudrate = baud
+        self.connection.port = port
+        self.connection.timeout = 0
         # Sets (ex: self.COM5_buffer) to be a slicedeque
         self.buffer = SliceDeque()
         self.add_thread(task=self.listen, name='serial_listener', 
@@ -134,6 +169,10 @@ class SerialListener(ThreadMonster):
     def stop(self):
         self.connection.close()
         super().stop()
+        
+    def start(self):
+        self.connection.open()
+        super().start()
      
     def listen(self):
         '''  Listens on a connection using connection.read(), returning the
@@ -198,12 +237,36 @@ class SerialDigester(SerialListener, PacketDigester):
         super().__init__(input_stream=None, *args, **kwargs)
         # This glues together the seriallistener and packetdigester
         self.input_stream = self.buffer
+        
+        
+class StatusServer(ThreadMonster):
+    def __init__(self, port, state_vector, verbose=False, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.port = port
+        self.state_vector = state_vector
+        # self.handler = TestHandler
+        if verbose:
+            self.handler = RestfulDictHandler
+        else:
+            self.handler = QuietRestfulDictHandler
+            
+        self.server = ThreadedStatefulSocketServer(self.state_vector, 
+            ('', port), self.handler)
+        self._threads['status_server'] = \
+                Thread(target=self.server.serve_forever, name='status_server', 
+                       args=(), daemon=True)
+
+    def stop(self):
+        self.server.shutdown()
+        super().stop()
     
     
 class UAVMaster(ThreadMonster):
-    def __init__(self, aimms_port, record_to_file=True, *args, **kwargs):
+    def __init__(self, aimms_port, http_port, record_to_file=True, 
+                 print_to_terminal=False, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.record = record_to_file
+        self.print_to_terminal = print_to_terminal
         
         # Now let's figure out what to call the output file.
         fprefix = 'sample_data_'
@@ -230,20 +293,27 @@ class UAVMaster(ThreadMonster):
         # Add whatever is needed to the state dictionary
         self.state['aimms'] = OrderedDict()
         
+        # Finally add the server
+        self.server = StatusServer(http_port, state_vector=self.state, 
+                                   verbose=print_to_terminal)
+        
     def run(self):
-        with self as control, self.aimms as aimms, self.recorder as recorder:
-            while True:
-                with MinimumLoopDelay(.01):
-                    # Get the packet from aimms and possibly record it
-                    obj = control.aimms.pop()
-                    if obj:
-                        if control.record:
-                            control.recorder.schedule_object(obj)
-                        # Update state and print it
-                        control.state['aimms'].update(obj)
-                        control.state['aimms'].update({'_type': 'state'})
-                        s = json.dumps(control.state['aimms'], indent=4)
-                        print(s)
+        with self, self.aimms, self.recorder, self.server:
+                while True:
+                    with MinimumLoopDelay(.01):
+                        # Get the packet from aimms and possibly record it
+                        obj = self.aimms.pop()
+                        if obj:
+                            # Add secondary unix timestamp
+                            obj.update({'timestamp': time.time()})
+                            if self.record:
+                                self.recorder.schedule_object(obj)
+                            # Update state and print it
+                            self.state['aimms'].update(obj)
+                            self.state['aimms'].update({'_type': 'state'})
+                            if self.print_to_terminal:
+                                s = json.dumps(self.state['aimms'], indent=4)
+                                print(s)
                 
     def stop(self):
         self.aimms.stop()
