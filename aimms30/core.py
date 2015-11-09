@@ -131,20 +131,21 @@ class FileRecorder(ThreadMonster):
             obj = self._file_q.get_nowait()
         except Empty:
             return
+            
+        # Open, if it hasn't been opened yet.
+        if not self._f:
+            self._f = open(self.filename, 'a+')
         
         s = json.dumps(obj)
         self._f.write(s)
         self._f.write('\n')
-            
-    def __enter__(self):
-        super().__enter__()
-        # Open our file and do the usual return.
-        self._f = open(self.filename, 'a+')
-        return self
         
     def __exit__(self, *args, **kwargs):
         # Close our file, then call super.
-        self._f.close()
+        if self._f:
+            self._f.close()
+        # Reset state, regardless (tiny performance hit; reliability assurance)
+        self._f = None
         super().__exit__(*args, **kwargs)
             
     def schedule_object(self, obj):
